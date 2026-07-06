@@ -1,6 +1,6 @@
 // ==WindhawkMod==
 // @id              macos-shake-to-find-cursor
-// @name            macOS Shake to Find Cursor
+// @name            11macOS Shake to Find Cursor
 // @description     Smoothly enlarges the mouse cursor when shaken back and forth system-wide.
 // @version         0.5
 // @author          samiulislam16
