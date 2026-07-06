@@ -11,7 +11,7 @@ smoothly animates back to its normal size.
 1. Shake your mouse rapidly left-right (or up-down)
 2. The cursor enlarges so you can find it easily
 3. Stop moving and it shrinks back to normal
-4. Restart explorer if neened
+4. Restart explorer if needed
 
 ## Settings
 - *Cursor scale* — how large the cursor grows (e.g. 350 = 3.5×)
