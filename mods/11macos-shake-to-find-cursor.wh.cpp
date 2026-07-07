@@ -2,10 +2,10 @@
 // @id              11macos-shake-to-find-cursor
 // @name            11macOS Shake to Find Cursor
 // @description     Smoothly enlarges the mouse cursor when shaken back and forth system-wide.
-// @version         0.5
+// @version         1.0.0
 // @author          samiulislam16
 // @github          https://github.com/samiulislam16
-// @include         *
+// @include         explorer.exe
 // @compilerOptions -luser32 -lgdi32 -lshcore
 // @license         MIT
 // ==/WindhawkMod==
@@ -19,12 +19,6 @@ Brings the beloved macOS "Shake mouse pointer to locate" feature to Windows!
 When you rapidly shake your mouse back and forth, the cursor temporarily
 grows larger to help you spot it on screen. Once you stop shaking, it
 smoothly animates back to its normal size.
-
-## How to Use
-1. Shake your mouse rapidly left-right (or up-down)
-2. The cursor enlarges so you can find it easily
-3. Stop moving and it shrinks back to normal
-4. Restart explorer if needed
 
 ## Settings
 - *Cursor scale* — how large the cursor grows (e.g. 350 = 3.5×)
@@ -55,8 +49,6 @@ smoothly animates back to its normal size.
 #include <vector>
 #include <cmath>
 
-// ─── Runtime settings (loaded from Windhawk UI) ─────────────────────────────
-
 struct ModSettings {
     double scaleFactor;
     int    enlargeDurationMs;
@@ -82,8 +74,6 @@ static void LoadSettings() {
     g_cfg.minMovementSpeed = (double)speed;
 }
 
-// ─── Constants (non-configurable) ───────────────────────────────────────────
-
 static constexpr size_t kHistorySize   = 10;
 static constexpr int    kMaxTimeWindow = 400;
 
@@ -92,16 +82,11 @@ struct MouseSample {
     DWORD time;
 };
 
-// ─── Global state ───────────────────────────────────────────────────────────
-
 std::vector<MouseSample> g_history;
 bool g_isEnlarged = false;
-HCURSOR g_hNormalCursor = NULL;
-HCURSOR g_hEnlargedCursor = NULL;
-UINT_PTR g_nResetTimerId = 0;
-UINT_PTR g_nPollingTimerId = 0;
-
-// ─── Cursor scaling ─────────────────────────────────────────────────────────
+DWORD g_lastShakeTime = 0;
+HANDLE g_hThread = NULL;
+bool g_runThread = false;
 
 HCURSOR CreateScaledCursor(HCURSOR hSrcCursor, float scale) {
     if (!hSrcCursor) return NULL;
@@ -119,8 +104,8 @@ HCURSOR CreateScaledCursor(HCURSOR hSrcCursor, float scale) {
     HDC hdcDst = CreateCompatibleDC(hdc);
 
     HBITMAP hbmColorNew = CreateCompatibleBitmap(hdc, newWidth, newHeight);
-    SelectObject(hdcSrc, iconInfo.hbmColor);
-    SelectObject(hdcDst, hbmColorNew);
+    HGDIOBJ hOldSrc = SelectObject(hdcSrc, iconInfo.hbmColor);
+    HGDIOBJ hOldDst = SelectObject(hdcDst, hbmColorNew);
     StretchBlt(hdcDst, 0, 0, newWidth, newHeight, hdcSrc, 0, 0, bmColor.bmWidth, bmColor.bmHeight, SRCCOPY);
 
     HBITMAP hbmMaskNew = CreateCompatibleBitmap(hdc, newWidth, newHeight);
@@ -128,6 +113,8 @@ HCURSOR CreateScaledCursor(HCURSOR hSrcCursor, float scale) {
     SelectObject(hdcDst, hbmMaskNew);
     StretchBlt(hdcDst, 0, 0, newWidth, newHeight, hdcSrc, 0, 0, bmColor.bmWidth, bmColor.bmHeight, SRCCOPY);
 
+    SelectObject(hdcSrc, hOldSrc);
+    SelectObject(hdcDst, hOldDst);
     DeleteDC(hdcSrc);
     DeleteDC(hdcDst);
     ReleaseDC(NULL, hdc);
@@ -149,22 +136,12 @@ HCURSOR CreateScaledCursor(HCURSOR hSrcCursor, float scale) {
     return hNewCursor;
 }
 
-// ─── Cursor restore ─────────────────────────────────────────────────────────
-
 void RestoreCursor() {
     if (g_isEnlarged) {
         SystemParametersInfo(SPI_SETCURSORS, 0, NULL, SPIF_SENDCHANGE);
         g_isEnlarged = false;
     }
 }
-
-VOID CALLBACK ResetTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime) {
-    KillTimer(NULL, g_nResetTimerId);
-    g_nResetTimerId = 0;
-    RestoreCursor();
-}
-
-// ─── Shake detection + trigger ──────────────────────────────────────────────
 
 void ProcessMouseTelemetry(POINT pt) {
     DWORD time = GetTickCount();
@@ -184,7 +161,7 @@ void ProcessMouseTelemetry(POINT pt) {
     for (size_t i = 1; i < g_history.size(); ++i) {
         int dx = g_history[i].pt.x - g_history[i - 1].pt.x;
         int dy = g_history[i].pt.y - g_history[i - 1].pt.y;
-        totalDistance += sqrt(float(dx * dx + dy * dy));
+        totalDistance += std::sqrt((float)(dx * dx + dy * dy));
 
         int dirX = (dx > 0) ? 1 : ((dx < 0) ? -1 : 0);
         int dirY = (dy > 0) ? 1 : ((dy < 0) ? -1 : 0);
@@ -207,44 +184,56 @@ void ProcessMouseTelemetry(POINT pt) {
     if (speed > g_cfg.minMovementSpeed &&
        (dirChangesX >= g_cfg.minDirectionChanges || dirChangesY >= g_cfg.minDirectionChanges)) {
 
-        if (!g_isEnlarged) {
-            g_hNormalCursor = LoadCursor(NULL, IDC_ARROW);
-            g_hEnlargedCursor = CreateScaledCursor(g_hNormalCursor, (float)g_cfg.scaleFactor);
+        g_lastShakeTime = time;
 
-            if (g_hEnlargedCursor) {
-                SetSystemCursor(CopyCursor(g_hEnlargedCursor), 32512); // OCR_NORMAL
+        if (!g_isEnlarged) {
+            HCURSOR hNormalCursor = LoadCursor(NULL, IDC_ARROW);
+            HCURSOR hEnlargedCursor = CreateScaledCursor(hNormalCursor, (float)g_cfg.scaleFactor);
+
+            if (hEnlargedCursor) {
+                SetSystemCursor(hEnlargedCursor, 32512); // 32512 = OCR_NORMAL
                 g_isEnlarged = true;
             }
         }
-
-        if (g_nResetTimerId) KillTimer(NULL, g_nResetTimerId);
-        g_nResetTimerId = SetTimer(NULL, 0, g_cfg.enlargeDurationMs, ResetTimerProc);
+    } else {
+        if (g_isEnlarged && (time - g_lastShakeTime > (DWORD)g_cfg.enlargeDurationMs)) {
+            RestoreCursor();
+        }
     }
 }
 
-// ─── Polling timer ──────────────────────────────────────────────────────────
-
-VOID CALLBACK PollingTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime) {
-    CURSORINFO ci = { sizeof(CURSORINFO) };
-    if (GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING)) {
-        ProcessMouseTelemetry(ci.ptScreenPos);
+DWORD WINAPI HardwarePollingThread(LPVOID lpParam) {
+    while (g_runThread) {
+        POINT pt;
+        if (GetPhysicalCursorPos(&pt)) {
+            ProcessMouseTelemetry(pt);
+        }
+        Sleep(16); // 16ms sleep corresponds to ~60Hz polling
     }
+    return 0;
 }
-
-// ─── Windhawk entry points ──────────────────────────────────────────────────
 
 BOOL Wh_ModInit(void) {
     LoadSettings();
-    g_nPollingTimerId = SetTimer(NULL, 0, 16, PollingTimerProc);
-    return (g_nPollingTimerId != 0);
+    
+    // Strict isolation enforcement constraint layout paths
+    wchar_t processPath[MAX_PATH];
+    GetModuleFileNameW(NULL, processPath, MAX_PATH);
+    if (wcsstr(processPath, L"explorer.exe") == nullptr) {
+        return TRUE; 
+    }
+
+    g_runThread = true;
+    g_hThread = CreateThread(NULL, 0, HardwarePollingThread, NULL, 0, NULL);
+    return (g_hThread != NULL);
 }
 
 void Wh_ModUninit(void) {
-    if (g_nPollingTimerId) {
-        KillTimer(NULL, g_nPollingTimerId);
-    }
-    if (g_nResetTimerId) {
-        KillTimer(NULL, g_nResetTimerId);
+    g_runThread = false;
+    if (g_hThread) {
+        WaitForSingleObject(g_hThread, 500);
+        CloseHandle(g_hThread);
+        g_hThread = NULL;
     }
     RestoreCursor();
 }
