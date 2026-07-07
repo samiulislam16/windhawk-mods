@@ -1,34 +1,23 @@
 // ==WindhawkMod==
-// @id              11macos-shake-to-find-cursor
+// @id              macos-shake-to-find-cursor
 // @name            11macOS Shake to Find Cursor
-// @description     Smoothly enlarges the mouse cursor when shaken back and forth system-wide.
-// @version         0.5
+// @description     Smoothly enlarges the mouse cursor using pre-cached stepping arrays system-wide.
+// @version         1.3.0
 // @author          samiulislam16
-// @github          https://github.com/samiulislam16
-// @include         *
+// @github          https://github.com
+// @include         explorer.exe
 // @compilerOptions -luser32 -lgdi32 -lshcore
 // @license         MIT
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
 /*
-# Shake to Find Cursor
+# Shake to Find Cursor (Smooth Animation)
 
 Brings the beloved macOS "Shake mouse pointer to locate" feature to Windows!
 
-When you rapidly shake your mouse back and forth, the cursor temporarily
-grows larger to help you spot it on screen. Once you stop shaking, it
-smoothly animates back to its normal size.
-
-## How to Use
-1. Shake your mouse rapidly left-right (or up-down)
-2. The cursor enlarges so you can find it easily
-3. Stop moving and it shrinks back to normal
-
-## Settings
-- *Cursor scale* — how large the cursor grows (e.g. 350 = 3.5×)
-- *Enlarge duration* — how long the cursor stays big after shaking stops (ms)
-- *Shake sensitivity* — minimum direction changes needed to trigger
+This version utilizes a safe, pre-cached rendering pipeline to smoothly 
+animate the transition from normal size to your custom enlarged scale.
 */
 // ==/WindhawkModReadme==
 
@@ -54,8 +43,6 @@ smoothly animates back to its normal size.
 #include <vector>
 #include <cmath>
 
-// ─── Runtime settings (loaded from Windhawk UI) ─────────────────────────────
-
 struct ModSettings {
     double scaleFactor;
     int    enlargeDurationMs;
@@ -64,24 +51,9 @@ struct ModSettings {
 };
 
 static ModSettings g_cfg;
-
-static void LoadSettings() {
-    int scale = Wh_GetIntSetting(L"cursorScale");
-    if (scale <= 100) scale = 350;
-    g_cfg.scaleFactor = scale / 100.0;
-
-    g_cfg.enlargeDurationMs = Wh_GetIntSetting(L"enlargeDuration");
-    if (g_cfg.enlargeDurationMs <= 0) g_cfg.enlargeDurationMs = 500;
-
-    g_cfg.minDirectionChanges = Wh_GetIntSetting(L"shakeSensitivity");
-    if (g_cfg.minDirectionChanges <= 0) g_cfg.minDirectionChanges = 4;
-
-    int speed = Wh_GetIntSetting(L"minSpeed");
-    if (speed <= 0) speed = 550;
-    g_cfg.minMovementSpeed = (double)speed;
-}
-
-// ─── Constants (non-configurable) ───────────────────────────────────────────
+static constexpr int kAnimationSteps = 4; // 4 pre-calculated stepping nodes
+static HCURSOR g_cachedCursors[kAnimationSteps] = { NULL };
+static int g_currentAnimIndex = 0;
 
 static constexpr size_t kHistorySize   = 10;
 static constexpr int    kMaxTimeWindow = 400;
@@ -91,16 +63,11 @@ struct MouseSample {
     DWORD time;
 };
 
-// ─── Global state ───────────────────────────────────────────────────────────
-
 std::vector<MouseSample> g_history;
 bool g_isEnlarged = false;
-HCURSOR g_hNormalCursor = NULL;
-HCURSOR g_hEnlargedCursor = NULL;
-UINT_PTR g_nResetTimerId = 0;
-UINT_PTR g_nPollingTimerId = 0;
-
-// ─── Cursor scaling ─────────────────────────────────────────────────────────
+DWORD g_lastShakeTime = 0;
+HANDLE g_hThread = NULL;
+bool g_runThread = false;
 
 HCURSOR CreateScaledCursor(HCURSOR hSrcCursor, float scale) {
     if (!hSrcCursor) return NULL;
@@ -118,8 +85,8 @@ HCURSOR CreateScaledCursor(HCURSOR hSrcCursor, float scale) {
     HDC hdcDst = CreateCompatibleDC(hdc);
 
     HBITMAP hbmColorNew = CreateCompatibleBitmap(hdc, newWidth, newHeight);
-    SelectObject(hdcSrc, iconInfo.hbmColor);
-    SelectObject(hdcDst, hbmColorNew);
+    HGDIOBJ hOldSrc = SelectObject(hdcSrc, iconInfo.hbmColor);
+    HGDIOBJ hOldDst = SelectObject(hdcDst, hbmColorNew);
     StretchBlt(hdcDst, 0, 0, newWidth, newHeight, hdcSrc, 0, 0, bmColor.bmWidth, bmColor.bmHeight, SRCCOPY);
 
     HBITMAP hbmMaskNew = CreateCompatibleBitmap(hdc, newWidth, newHeight);
@@ -127,6 +94,8 @@ HCURSOR CreateScaledCursor(HCURSOR hSrcCursor, float scale) {
     SelectObject(hdcDst, hbmMaskNew);
     StretchBlt(hdcDst, 0, 0, newWidth, newHeight, hdcSrc, 0, 0, bmColor.bmWidth, bmColor.bmHeight, SRCCOPY);
 
+    SelectObject(hdcSrc, hOldSrc);
+    SelectObject(hdcDst, hOldDst);
     DeleteDC(hdcSrc);
     DeleteDC(hdcDst);
     ReleaseDC(NULL, hdc);
@@ -148,22 +117,55 @@ HCURSOR CreateScaledCursor(HCURSOR hSrcCursor, float scale) {
     return hNewCursor;
 }
 
-// ─── Cursor restore ─────────────────────────────────────────────────────────
+void FreeCachedCursors() {
+    for (int i = 0; i < kAnimationSteps; ++i) {
+        if (g_cachedCursors[i]) {
+            DestroyCursor(g_cachedCursors[i]);
+            g_cachedCursors[i] = NULL;
+        }
+    }
+}
+
+// Generates the sizes exactly ONCE during load/settings modifications
+void PreCacheAllCursors() {
+    FreeCachedCursors();
+    HCURSOR hBase = LoadCursor(NULL, IDC_ARROW);
+    if (!hBase) return;
+
+    double maxScale = g_cfg.scaleFactor;
+    for (int i = 0; i < kAnimationSteps; ++i) {
+        // Linearly distribute scales between 1.25x and maxScale
+        double t = (double)i / (kAnimationSteps - 1);
+        double stepScale = 1.25 + t * (maxScale - 1.25);
+        g_cachedCursors[i] = CreateScaledCursor(hBase, (float)stepScale);
+    }
+}
+
+static void LoadSettings() {
+    int scale = Wh_GetIntSetting(L"cursorScale");
+    if (scale <= 100) scale = 350;
+    g_cfg.scaleFactor = scale / 100.0;
+
+    g_cfg.enlargeDurationMs = Wh_GetIntSetting(L"enlargeDuration");
+    if (g_cfg.enlargeDurationMs <= 0) g_cfg.enlargeDurationMs = 500;
+
+    g_cfg.minDirectionChanges = Wh_GetIntSetting(L"shakeSensitivity");
+    if (g_cfg.minDirectionChanges <= 0) g_cfg.minDirectionChanges = 4;
+
+    int speed = Wh_GetIntSetting(L"minSpeed");
+    if (speed <= 0) speed = 550;
+    g_cfg.minMovementSpeed = (double)speed;
+
+    PreCacheAllCursors();
+}
 
 void RestoreCursor() {
     if (g_isEnlarged) {
         SystemParametersInfo(SPI_SETCURSORS, 0, NULL, SPIF_SENDCHANGE);
         g_isEnlarged = false;
+        g_currentAnimIndex = 0;
     }
 }
-
-VOID CALLBACK ResetTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime) {
-    KillTimer(NULL, g_nResetTimerId);
-    g_nResetTimerId = 0;
-    RestoreCursor();
-}
-
-// ─── Shake detection + trigger ──────────────────────────────────────────────
 
 void ProcessMouseTelemetry(POINT pt) {
     DWORD time = GetTickCount();
@@ -183,7 +185,7 @@ void ProcessMouseTelemetry(POINT pt) {
     for (size_t i = 1; i < g_history.size(); ++i) {
         int dx = g_history[i].pt.x - g_history[i - 1].pt.x;
         int dy = g_history[i].pt.y - g_history[i - 1].pt.y;
-        totalDistance += sqrt(float(dx * dx + dy * dy));
+        totalDistance += std::sqrt((float)(dx * dx + dy * dy));
 
         int dirX = (dx > 0) ? 1 : ((dx < 0) ? -1 : 0);
         int dirY = (dy > 0) ? 1 : ((dy < 0) ? -1 : 0);
@@ -205,47 +207,66 @@ void ProcessMouseTelemetry(POINT pt) {
 
     if (speed > g_cfg.minMovementSpeed &&
        (dirChangesX >= g_cfg.minDirectionChanges || dirChangesY >= g_cfg.minDirectionChanges)) {
+        g_lastShakeTime = time;
 
-        if (!g_isEnlarged) {
-            g_hNormalCursor = LoadCursor(NULL, IDC_ARROW);
-            g_hEnlargedCursor = CreateScaledCursor(g_hNormalCursor, (float)g_cfg.scaleFactor);
-
-            if (g_hEnlargedCursor) {
-                SetSystemCursor(CopyCursor(g_hEnlargedCursor), 32512); // OCR_NORMAL
+        // Animate UP frame-by-frame smoothly
+        if (g_currentAnimIndex < (kAnimationSteps - 1)) {
+            g_currentAnimIndex++;
+            if (g_cachedCursors[g_currentAnimIndex]) {
+                SetSystemCursor(CopyCursor(g_cachedCursors[g_currentAnimIndex]), 32512);
                 g_isEnlarged = true;
             }
         }
-
-        if (g_nResetTimerId) KillTimer(NULL, g_nResetTimerId);
-        g_nResetTimerId = SetTimer(NULL, 0, g_cfg.enlargeDurationMs, ResetTimerProc);
+    } else {
+        if (g_isEnlarged && (time - g_lastShakeTime > (DWORD)g_cfg.enlargeDurationMs)) {
+            // Animate DOWN step-by-step smoothly
+            if (g_currentAnimIndex > 0) {
+                g_currentAnimIndex--;
+                if (g_cachedCursors[g_currentAnimIndex]) {
+                    SetSystemCursor(CopyCursor(g_cachedCursors[g_currentAnimIndex]), 32512);
+                }
+            } else {
+                RestoreCursor();
+            }
+        }
     }
 }
 
-// ─── Polling timer ──────────────────────────────────────────────────────────
-
-VOID CALLBACK PollingTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime) {
-    CURSORINFO ci = { sizeof(CURSORINFO) };
-    if (GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING)) {
-        ProcessMouseTelemetry(ci.ptScreenPos);
+DWORD WINAPI HardwarePollingThread(LPVOID lpParam) {
+    while (g_runThread) {
+        POINT pt;
+        if (GetPhysicalCursorPos(&pt)) {
+            ProcessMouseTelemetry(pt);
+        }
+        // Slightly lengthened sleep constraint to let the eye track the frame increments
+        Sleep(32); 
     }
+    return 0;
 }
-
-// ─── Windhawk entry points ──────────────────────────────────────────────────
 
 BOOL Wh_ModInit(void) {
     LoadSettings();
-    g_nPollingTimerId = SetTimer(NULL, 0, 16, PollingTimerProc);
-    return (g_nPollingTimerId != 0);
+    
+    wchar_t processPath[MAX_PATH];
+    GetModuleFileNameW(NULL, processPath, MAX_PATH);
+    if (wcsstr(processPath, L"explorer.exe") == nullptr) {
+        return TRUE; 
+    }
+
+    g_runThread = true;
+    g_hThread = CreateThread(NULL, 0, HardwarePollingThread, NULL, 0, NULL);
+    return (g_hThread != NULL);
 }
 
 void Wh_ModUninit(void) {
-    if (g_nPollingTimerId) {
-        KillTimer(NULL, g_nPollingTimerId);
-    }
-    if (g_nResetTimerId) {
-        KillTimer(NULL, g_nResetTimerId);
+    g_runThread = false;
+    if (g_hThread) {
+        WaitForSingleObject(g_hThread, 500);
+        CloseHandle(g_hThread);
+        g_hThread = NULL;
     }
     RestoreCursor();
+    FreeCachedCursors();
 }
 
 void Wh_ModSettingsChanged(void) {
