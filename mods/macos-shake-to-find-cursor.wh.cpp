@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              macos-shake-to-find-cursor
-// @name            11macOS Shake to Find Cursor
+// @name            macOS Shake to Find Cursor
 // @description     Smoothly enlarges the mouse cursor when shaken back and forth system-wide.
-// @version         1.0.0
+// @version         1.0.1
 // @author          samiulislam16
 // @github          https://github.com/samiulislam16
 // @include         explorer.exe
@@ -15,10 +15,10 @@
 # Shake to Find Cursor
 
 Brings the beloved macOS "Shake mouse pointer to locate" feature to Windows!
-
+https://raw.githubusercontent.com/samiulislam16/windhawk-mods/refs/heads/main/mods/mods/Recording%202026-07-07%20201826.gif
 When you rapidly shake your mouse back and forth, the cursor temporarily
 grows larger to help you spot it on screen. Once you stop shaking, it
-smoothly animates back to its normal size.
+smoothly animates back to its normal size. Restart explorer if needed
 
 ## Settings
 - *Cursor scale* — how large the cursor grows (e.g. 350 = 3.5×)
